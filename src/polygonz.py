@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 '''Lowpolify any image using Delaunay triangulation'''
-import os
-import sys
-import random
-import warnings
+import os, sys, random, warnings, itertools
+import cv2, dlib, sharedmem, numpy as np
 from multiprocessing import Process
-import cv2
-import numpy as np
-from scipy.spatial import Delaunay #pylint: disable-msg=E0611
-import dlib
-import itertools
-import sharedmem
+from scipy.spatial import Delaunay
 
 # Path to predictor used in face detection model
 predictor_path = os.path.join(
@@ -21,58 +14,24 @@ predictor_path = os.path.join(
 # Threshold for intra-triangle variance
 varhtresh = 25
 
-def chunk(l, n):
-	'''Splits a list into n chunks'''
-	for i in range(0, len(l), n):
-		yield l[i:i + n]
-
-def builder(part, tridex, lowpoly_image, highpoly_image):
-	'''Generates a portion of the final image'''
-	for tri in part:
-		lowpoly_image[tridex == tri, :] = np.mean(highpoly_image[tridex == tri, :], axis=0)
-
-def PolyArea(x,y):
-	'''Returns area of triangle'''
-	return 0.5 * np.abs(np.dot(x, np.roll(y,1)) - np.dot(y,np.roll(x,1)))
+DEFAULT_FRACTION_PERCENT = 0.15
 
 
-def get_lowpoly(tris, highpoly_image):
-	'''Returns low poly image'''
-	# 'highpoly_image.shape[:2]' returns the dimensions of the image.
-	# 'np.ones(highpoly_image.shape[:2])' gives same size image, filled with 1.
-	# So subs contains an array of all coordinates of new array.
-	subs = np.transpose(np.where(np.ones(highpoly_image.shape[:2])))
-	subs = subs[:, :2]
-	# Find the simplices in 'tris' containing the given points
-	tridex = tris.find_simplex(subs)
-	# Array of image dimensions with mapping to the repective simplices.
-	tridex = tridex.reshape(highpoly_image.shape[:2])
-	# Retrieve the unique simplices from tridex
-	p_tris = np.unique(tridex)
-	N = 2
-	# Split the list into multiple parts, to enable parallel processing
-	chunks = list(chunk(p_tris, len(p_tris) // N))
-	# Initialize output image (3-channel)
-	# lowpoly_image contains mean of all such points from highpoly_image, where
-	# tridex = tri
-	# lowpoly_image = np.zeros(highpoly_image.shape)#, dtype=np.uint8)
-	# lowpoly_image.fill(0)
-	lowpoly_image = sharedmem.empty(highpoly_image.shape)
-	lowpoly_image.fill(0)
-	# Start 4 different processes to simultaneouly process different simplices
-	processes = [Process(target=builder, args=(
-		chunks[i], tridex, lowpoly_image, highpoly_image)) for i in range(N)]
-	# Start each process
-	for p in processes:
-		p.start()
-	# Wait for all process to finish
-	for p in processes:
-		p.join()
+def pre_process(highpoly_image, newSize=None):
+	'''Preprocessing helper'''
+	# Handle grayscale images
+	if highpoly_image.shape[2] == 1:
+		highpoly_image = highpoly_image.dstack([highpoly_image, highpoly_image, highpoly_image])
 
-	# unint8 represents Unsigned integer (0 to 255)
-	lowpoly_image = lowpoly_image.astype(np.uint8)
-	# return low-poly image
-	return lowpoly_image
+	# Resize image. Easier to process.
+	if ((newSize is not None) and (newSize < np.max(highpoly_image.shape[:2]))):
+		scale          = newSize / float(np.max(highpoly_image.shape[:2]))
+		highpoly_image = cv2.resize(highpoly_image, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+	# Reduce noise in image using cv::cuda::fastNlMeansDenoisingColored. Via: http://www.ipol.im/pub/art/2011/bcm_nlm/
+	noiseless_highpoly_image = cv2.fastNlMeansDenoisingColored(highpoly_image, None, 10, 10, 7, 21)
+
+	return highpoly_image, noiseless_highpoly_image
 
 def get_triangulation(im, gray_image, a=50, b=55, c=0.15, show=False, randomize=False):
 	'''Returns triangulations'''
@@ -170,86 +129,106 @@ def get_triangulation(im, gray_image, a=50, b=55, c=0.15, show=False, randomize=
 	tris.close()
 	return tris
 
-def pre_process(highpoly_image, newSize=None):
-	'''Preprocessing helper'''
-	print('Preprocessing')
-	# Handle grayscale images
-	if highpoly_image.shape[2] == 1:
-		# 'dstack' concatenates images along the third dimension
-		# Similar to np.concatenate(tup, axis=2)
-		# So basically, extending a gray scale image to a 3 channel image
-		highpoly_image = highpoly_image.dstack(
-			[highpoly_image, highpoly_image, highpoly_image])
-	# Resize image. Easier to process.
-	if newSize is not None:
-		if newSize < np.max(highpoly_image.shape[:2]):
-			scale = newSize / float(np.max(highpoly_image.shape[:2]))
-			highpoly_image = cv2.resize(
-				highpoly_image, (0, 0), fx=scale, fy=scale,
-				interpolation=cv2.INTER_AREA)
-	# Reduce noise in image using cv::cuda::fastNlMeansDenoisingColored
-	# Reference: http://www.ipol.im/pub/art/2011/bcm_nlm/
-	noiseless_highpoly_image = cv2.fastNlMeansDenoisingColored(
-		highpoly_image, None, 10, 10, 7, 21)
-	print('Preprocessing complete')
-	return highpoly_image, noiseless_highpoly_image
+def chunk(l, n):
+	'''Splits a list into n chunks'''
+	for i in range(0, len(l), n):
+		yield l[i:i + n]
+
+def builder(part, tridex, lowpoly_image, highpoly_image):
+	'''Generates a portion of the final image'''
+	for tri in part:
+		lowpoly_image[tridex == tri, :] = np.mean(highpoly_image[tridex == tri, :], axis=0)
+
+def get_lowpoly(tris, highpoly_image):
+	'''Returns low poly image'''
+	# 'highpoly_image.shape[:2]' 					returns the dimensions of the image.
+	# 'np.ones(highpoly_image.shape[:2])' gives same size image, filled with 1.
+	# So subs contains an array of all coordinates of new array.
+	subs = np.transpose(np.where(np.ones(highpoly_image.shape[:2])))
+	subs = subs[:, :2]
+
+	# Find the simplices in 'tris' containing the given points
+	tridex = tris.find_simplex(subs)
+
+	# Array of image dimensions with mapping to the repective simplices.
+	tridex = tridex.reshape(highpoly_image.shape[:2])
+
+	# Retrieve the unique simplices from tridex
+	p_tris = np.unique(tridex)
+	N = 2
+
+	# Split the list into multiple parts, to enable parallel processing
+	chunks = list(chunk(p_tris, len(p_tris) // N))
+
+	# Initialize output image (3-channel)
+	# lowpoly_image contains mean of all such points from highpoly_image, where
+	# tridex = tri
+	# lowpoly_image = np.zeros(highpoly_image.shape)#, dtype=np.uint8)
+	# lowpoly_image.fill(0)
+	lowpoly_image = sharedmem.empty(highpoly_image.shape)
+	lowpoly_image.fill(0)
+
+	# Start 4 different processes to simultaneouly process different simplices
+	processes = [Process(target=builder, args=(
+		chunks[i], tridex, lowpoly_image, highpoly_image)) for i in range(N)]
+
+	# Start each process
+	for p in processes:
+		p.start()
+
+	# Wait for all process to finish
+	for p in processes:
+		p.join()
+
+	# unint8 represents Unsigned integer (0 to 255)
+	lowpoly_image = lowpoly_image.astype(np.uint8)
+	# return low-poly image
+	return lowpoly_image
+
 
 def helper(inImage, c=0.3, outImage=None, show=False):
 	'''Helper function'''
-	# Read the input image
+	# Read
 	highpoly_image = cv2.imread(inImage)
+
 	# Call 'pre_process' function
 	highpoly_image, noiseless_highpoly_image = pre_process(highpoly_image, 1200)
-	print('Begin thresholding')
 
+	# Thresholding
 	# Use Otsu's method for calculating thresholds
-	gray_image = cv2.cvtColor(noiseless_highpoly_image, cv2.COLOR_BGR2GRAY)
+	gray_image  = cv2.cvtColor(noiseless_highpoly_image, cv2.COLOR_BGR2GRAY)
 	ycbcr_image = cv2.cvtColor(noiseless_highpoly_image, cv2.COLOR_RGB2YCrCb)
+
 	for xdim in range(ycbcr_image.shape[0]):
 		for ydim in range(ycbcr_image.shape[1]):
 			ycbcr_image[xdim][ydim] = ycbcr_image[xdim][ydim][0]
 	ycbcr_image = ycbcr_image[:, :, 0]
-	clahe = cv2.createCLAHE()
-	normalized_gray_image = clahe.apply(gray_image)
-	if show:
-		compare = np.hstack([gray_image, ycbcr_image])
-		cv2.imshow('gray images', compare)
-		cv2.waitKey(0)
-		cv2.destroyAllWindows()
-	high_thresh, thresh_im = cv2.threshold(
-		ycbcr_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-	if show:
-		cv2.imshow('otsu image', thresh_im)
-		cv2.waitKey(0)
-		cv2.destroyAllWindows()
+	clahe                  = cv2.createCLAHE()
+	normalized_gray_image  = clahe.apply(gray_image)
+	high_thresh, thresh_im = cv2.threshold(ycbcr_image, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
 
 	low_thresh         = 0.5 * high_thresh
 	blurred_gray_image = cv2.GaussianBlur(gray_image, (0, 0), 3)
 	sharp_gray_image   = cv2.addWeighted(gray_image, 2.5, blurred_gray_image, -1, 0)
-	if show:
-		cv2.imshow('Sharp gray image', sharp_gray_image)
-		cv2.waitKey(0)
-		cv2.destroyAllWindows()
-	# Call 'get_triangulation' function
-	print('Triangulating')
+
+	# Call 'get_triangulation' function: COMPUTES TRIANGLES
 	tris = get_triangulation(highpoly_image, sharp_gray_image, low_thresh, high_thresh, c, show)
-	# Call 'get_lowpoly' function
-	print('Triangulation complete. Begin rendering...')
+
+	# Call 'get_lowpoly' function: RENDERS TRIANGLES
 	lowpoly_image = get_lowpoly(tris, highpoly_image)
 	print('Rendering complete')
+
+	# Resize
 	if np.max(highpoly_image.shape[:2]) < 750:
-		scale = 750 / float(np.max(highpoly_image.shape[:2]))
-		lowpoly_image = cv2.resize(lowpoly_image, None, fx=scale,
-								   fy=scale, interpolation=cv2.INTER_CUBIC)
-	if show:
-		compare = np.hstack([highpoly_image, lowpoly_image])
-		cv2.imshow('Compare', compare)
-		cv2.waitKey(0)
-		cv2.destroyAllWindows()
+		scale         = 750 / float(np.max(highpoly_image.shape[:2]))
+		lowpoly_image = cv2.resize(lowpoly_image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
 	if outImage is not None:
 		cv2.imwrite(outImage, lowpoly_image)
-		print('Done')
+
+	return lowpoly_image
+
 
 def main(args):
 	'''Main function'''
@@ -271,6 +250,7 @@ def main(args):
 		# Call helper function
 		helper(inImage=input_image, c=fraction,
 			   outImage=output_image, show=False)
+
 
 if __name__ == '__main__':
 	#warnings.filterwarnings("ignore")
