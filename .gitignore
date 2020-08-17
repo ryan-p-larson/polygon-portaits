@@ -1,3 +1,11 @@
 *.pyc
 **/__pycache__
 *.cpp
+.vscode/
+
+# Photos
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.gif

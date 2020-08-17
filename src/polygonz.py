@@ -1,190 +1,163 @@
 #!/usr/bin/env python3
-'''Lowpolify any image using Delaunay triangulation'''
-import os, sys, random, warnings, itertools
-import cv2, dlib, sharedmem, numpy as np
-from multiprocessing import Process
+"""
+Lowpolify any image using Delaunay triangulation
+
+Author: Ryan Larson, originally from @ghostwriternr: https://github.com/ghostwriternr/lowpolify
+"""
+from os.path import abspath, dirname, join
+from collections import defaultdict
+from typing import Tuple, List
+import cv2, dlib, numpy as np
 from scipy.spatial import Delaunay
+from skimage.draw import polygon as draw_polygon
+from shapely.geometry import Polygon
 
 # Path to predictor used in face detection model
-predictor_path = os.path.join(
-	os.path.abspath(os.path.dirname(__file__)),
-	"imgs",
-	"shape_predictor_68_face_landmarks.dat"
-)
-# Threshold for intra-triangle variance
-varhtresh = 25
+DEFAULT_LANDMARKS_PATH = join(abspath(dirname(__file__)), "imgs", "shape_predictor_68_face_landmarks.dat")
 
-DEFAULT_FRACTION_PERCENT = 0.15
+DEFAULT_CANNY_A: int = 50
+DEFAULT_CANNY_B: int = 55
+DEFAULT_FRACTION_PERCENT: float = 0.15
+
+DEFAULT_BG_BGR = [255, 255, 255]
+DEFAULT_BG_PAD = 100
 
 
-def pre_process(highpoly_image, newSize=None):
+def pre_process(original_image, resize=None) -> Tuple[np.ndarray, np.ndarray]:
 	'''Preprocessing helper'''
+	height, width, channels = original_image.shape
+
 	# Handle grayscale images
-	if highpoly_image.shape[2] == 1:
-		highpoly_image = highpoly_image.dstack([highpoly_image, highpoly_image, highpoly_image])
+	if (channels == 1):
+		original_image = original_image.dstack([original_image, original_image, original_image])
 
 	# Resize image. Easier to process.
-	if ((newSize is not None) and (newSize < np.max(highpoly_image.shape[:2]))):
-		scale          = newSize / float(np.max(highpoly_image.shape[:2]))
-		highpoly_image = cv2.resize(highpoly_image, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+	if ((resize is not None) and (resize < np.max(original_image.shape[:2]))):
+		scale          = resize / float(max(height, width))
+		original_image = cv2.resize(original_image, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
 	# Reduce noise in image using cv::cuda::fastNlMeansDenoisingColored. Via: http://www.ipol.im/pub/art/2011/bcm_nlm/
-	noiseless_highpoly_image = cv2.fastNlMeansDenoisingColored(highpoly_image, None, 10, 10, 7, 21)
+	noiseless_highpoly_image = cv2.fastNlMeansDenoisingColored(original_image, None, 10, 10, 7, 21)
 
-	return highpoly_image, noiseless_highpoly_image
+	return original_image, noiseless_highpoly_image
 
-def get_triangulation(im, gray_image, a=50, b=55, c=0.15, show=False, randomize=False):
-	'''Returns triangulations'''
-	# Using canny edge detection.
-	#
-	# Reference: http://docs.opencv.org/3.1.0/da/d22/tutorial_py_canny.html
-	# First argument: Input image
+def create_triangles(
+	image: np.ndarray,
+	gray_image: np.ndarray,
+	mask: np.ndarray,
+	a: int = DEFAULT_CANNY_A,
+	b: int = DEFAULT_CANNY_B,
+	c: float = DEFAULT_FRACTION_PERCENT,
+	show: bool = False) -> np.ndarray:
+	""" Returns triangulations
+		Given a raw portrait image, and its computed BW & Masked versions,
+		1. Search for faces, add landmarks
+		2. Add bottom left/right points for shoulders
+		3. Add points falling within mask
+		4. Create Delauney Triangles
+		5. Filter triangles whose centroid does not intersect mask
+	"""
+	height_image, width_image = image.shape[:2]
+	points: np.ndarray
+
+	# Using canny edge detection. Reference: http://docs.opencv.org/3.1.0/da/d22/tutorial_py_canny.html
+	# First argument : Input image
 	# Second argument: minVal (argument 'a')
-	# Third argument: maxVal (argument 'b')
-	#
-	# 'minVal' and 'maxVal' are used in the Hysterisis Thresholding step.
-	# Any edges with intensity gradient more than maxVal are sure to be edges
-	# and those below minVal are sure to be non-edges, so discarded. Those who
-	# lie between these two thresholds are classified edges or non-edges based
-	# on their connectivity.
-	detector  = dlib.get_frontal_face_detector()
-	predictor = dlib.shape_predictor(predictor_path)
-	edges     = cv2.Canny(gray_image, a, b)
-
-	if show:
-		cv2.imshow('Canny', edges)
-		cv2.waitKey(0)
-		cv2.destroyAllWindows()
-		win = dlib.image_window()
-	# Set number of points for low-poly edge vertices
-	num_points = int(np.where(edges)[0].size * c)
-
-	# Return the indices of the elements that are non-zero.
-	# 'nonzero' returns a tuple of arrays, one for each dimension of a,
-	# containing the indices of the non-zero elements in that dimension.
-	# So, r consists of row indices of non-zero elements, and c column indices.
-	r, c = np.nonzero(edges)
-
-	# r.shape, here, returns the count of all points that belong to an edge.
-	# So 'np.zeros(r.shape)' an array of this size, with all zeros.
-	# 'rnd' is thus an array of this size, with all values as 'False'.
-	rnd = np.zeros(r.shape) == 1
-	# Mark indices from beginning to 'num_points - 1' as True.
-	rnd[:num_points] = True
-	# Shuffle
+	# Third argument : maxVal (argument 'b')
+	edges        		= cv2.Canny(gray_image, a, b)
+	num_points   		= int(np.where(edges)[0].size * c)
+	r, c         		= np.nonzero(edges)
+	rnd          		= np.zeros(r.shape) == 1
+	rnd[:num_points]	= True
 	np.random.shuffle(rnd)
-	# Randomly select 'num_points' of points from the set of all edge vertices.
-	r = r[rnd]
-	c = c[rnd]
+	points 				= np.vstack([r[rnd], c[rnd]]).T
 
-	# Number of rows and columns in image
-	sz    = im.shape
-	r_max = sz[0]
-	c_max = sz[1]
+	# Using DLib to find facial landmarks
+	detector  = dlib.get_frontal_face_detector()
+	predictor = dlib.shape_predictor(DEFAULT_LANDMARKS_PATH)
+	dets 	  	= detector(image, 1)
+	shape 		= predictor(image, dets[0])
+	points 		= np.vstack([points,
+			[[shape.part(i).y, shape.part(i).x] for i in range(shape.num_parts)]])
 
-	# Co-ordinates of all randomly chosen points
-	pts = np.vstack([r, c]).T
-	if randomize:
-		rand_offset = 50
-		rand_dirs   = [(0, rand_offset), (-rand_offset, 0), (0, -rand_offset), (rand_offset, 0)]
-		rnd_count   = 0
-		for point in pts:
-			if random.random() < 0.3:
-				rnd_count += 1
-				rand_dir 	 = random.randint(0, 3)
-				point[0] 	+= rand_dirs[rand_dir][0]
-				point[1] 	+= rand_dirs[rand_dir][1]
+	# Filter to return only the points that fall within mask
+	filter_points = np.array([pt for pt in points
+			if (mask[tuple(pt)] == 255 if ((pt[1] < mask.shape[1]))  else False)])
 
-	# Append (0,0) to the vertical stack
-	pts = np.vstack([pts, [0, 0]])
-	# Append (0,c_max) to the vertical stack
-	pts = np.vstack([pts, [0, c_max]])
-	# Append (r_max,0) to the vertical stack
-	pts = np.vstack([pts, [r_max, 0]])
-	# Append (r_max,c_max) to the vertical stack
-	pts = np.vstack([pts, [r_max, c_max]])
-	# Append some random points to fill empty spaces
-	pts = np.vstack([pts, np.random.randint(0, 750, size=(100, 2))])
-	# print(len(pts))
-	# pts = my_reduce(pts, 5)
-	# print(len(pts))
-	dets = detector(im, 1)
-	# print("Number of faces detected: {}".format(len(dets)))
-	if show:
-		win.clear_overlay()
-		win.set_image(im)
-	for k, d in enumerate(dets):
-		shape = predictor(im, d)
-		for i in range(shape.num_parts):
-			pts = np.vstack([pts, [shape.part(i).x, shape.part(i).y]])
-		if show:
-			win.add_overlay(shape)
-	if show:
-		win.add_overlay(dets)
-		dlib.hit_enter_to_continue()
+	# Add bottom left/right to make the shoulders look better
+	filter_points = np.vstack([
+		filter_points, [height_image, 0], [height_image, width_image - 100]])
 
-	# Construct Delaunay Triangulation from these set of points.
-	# Reference: https://en.wikipedia.org/wiki/Delaunay_triangulation
-	tris = Delaunay(pts, incremental=True)
-	tris.close()
-	return tris
+	# Create Delauney triangles
+	delaunay         = Delaunay(filter_points, incremental=False)
+	triangles        = delaunay.points[delaunay.simplices]
+	filter_triangles = np.array([tri for tri in triangles
+			if (mask[int(Polygon(tri).centroid.x), int(Polygon(tri).centroid.y)] == 255)])
 
-def chunk(l, n):
-	'''Splits a list into n chunks'''
-	for i in range(0, len(l), n):
-		yield l[i:i + n]
+	return filter_triangles
 
-def builder(part, tridex, lowpoly_image, highpoly_image):
-	'''Generates a portion of the final image'''
-	for tri in part:
-		lowpoly_image[tridex == tri, :] = np.mean(highpoly_image[tridex == tri, :], axis=0)
+def render_triangles(
+	triangles: np.ndarray,
+	image: np.ndarray,
+	bg: np.ndarray = DEFAULT_BG_BGR) -> np.ndarray:
+	image_dim = image.shape
+	low_poly  = np.full(image_dim, fill_value=bg, dtype=image.dtype)
 
-def get_lowpoly(tris, highpoly_image):
-	'''Returns low poly image'''
-	# 'highpoly_image.shape[:2]' 					returns the dimensions of the image.
-	# 'np.ones(highpoly_image.shape[:2])' gives same size image, filled with 1.
-	# So subs contains an array of all coordinates of new array.
-	subs = np.transpose(np.where(np.ones(highpoly_image.shape[:2])))
-	subs = subs[:, :2]
+	for tri in triangles:
+		rr, cc     			 = draw_polygon(tri[:, 0], tri[:, 1], low_poly.shape)
+		color   				 = np.mean(image[draw_polygon(tri[:, 0], tri[:, 1], image_dim)], axis=0)
+		low_poly[rr, cc] = color
 
-	# Find the simplices in 'tris' containing the given points
-	tridex = tris.find_simplex(subs)
+	return low_poly
 
-	# Array of image dimensions with mapping to the repective simplices.
-	tridex = tridex.reshape(highpoly_image.shape[:2])
+def add_border(
+	image: np.ndarray,
+	pad: int = DEFAULT_BG_PAD,
+	color: np.ndarray = DEFAULT_BG_BGR) -> np.ndarray:
+	height, width   = image.shape[:2]
+	max_dim  				= max(height, width) + (2 * pad)
+	pad_more 				= (max_dim - min(height, width)) // 2
 
-	# Retrieve the unique simplices from tridex
-	p_tris = np.unique(tridex)
-	N = 2
+	# Assign paddings
+	landscape = width > height
+	top       = pad_more if (landscape) else pad
+	right     = pad if (landscape) else pad_more
+	bottom    = pad_more if (landscape) else pad
+	left      = pad if (landscape) else pad_more
 
-	# Split the list into multiple parts, to enable parallel processing
-	chunks = list(chunk(p_tris, len(p_tris) // N))
+	return cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
 
-	# Initialize output image (3-channel)
-	# lowpoly_image contains mean of all such points from highpoly_image, where
-	# tridex = tri
-	# lowpoly_image = np.zeros(highpoly_image.shape)#, dtype=np.uint8)
-	# lowpoly_image.fill(0)
-	lowpoly_image = sharedmem.empty(highpoly_image.shape)
-	lowpoly_image.fill(0)
+def mask_to_polygons(mask: np.ndarray, epsilon: float = 10., min_area: float =10.) -> List[Polygon]:
+	"""Convert a mask ndarray (binarized image) to Multipolygons"""
+	# first, rotate mask 180 because its flipped
+	mask_copy = mask.copy()[::-1, :]
 
-	# Start 4 different processes to simultaneouly process different simplices
-	processes = [Process(target=builder, args=(
-		chunks[i], tridex, lowpoly_image, highpoly_image)) for i in range(N)]
+	# second, find contours with cv2: it's much faster than shapely
+	contours, hierarchy = cv2.findContours(mask_copy, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
 
-	# Start each process
-	for p in processes:
-		p.start()
+	if not contours:
+			return MultiPolygon()
 
-	# Wait for all process to finish
-	for p in processes:
-		p.join()
+	# now messy stuff to associate parent and child contours
+	cnt_children   = defaultdict(list)
+	child_contours = set()
+	assert hierarchy.shape[0] == 1
 
-	# unint8 represents Unsigned integer (0 to 255)
-	lowpoly_image = lowpoly_image.astype(np.uint8)
-	# return low-poly image
-	return lowpoly_image
+	# http://docs.opencv.org/3.1.0/d9/d8b/tutorial_py_contours_hierarchy.html
+	for idx, (_, _, _, parent_idx) in enumerate(hierarchy[0]):
+			if parent_idx != -1:
+					child_contours.add(idx)
+					cnt_children[parent_idx].append(contours[idx])
 
+	# create actual polygons filtering by area (removes artifacts)
+	all_polygons = []
+	for idx, cnt in enumerate(contours):
+			if idx not in child_contours and cv2.contourArea(cnt) >= min_area:
+					assert cnt.shape[1] == 1
+					poly = Polygon(shell=cnt[:, 0, :], holes=[c[:, 0, :] for c in cnt_children.get(idx, []) if cv2.contourArea(c) >= min_area])
+					all_polygons.append(poly)
+
+	return all_polygons
 
 def helper(inImage, c=0.3, outImage=None, show=False):
 	'''Helper function'''
@@ -217,7 +190,6 @@ def helper(inImage, c=0.3, outImage=None, show=False):
 
 	# Call 'get_lowpoly' function: RENDERS TRIANGLES
 	lowpoly_image = get_lowpoly(tris, highpoly_image)
-	print('Rendering complete')
 
 	# Resize
 	if np.max(highpoly_image.shape[:2]) < 750:
@@ -228,30 +200,3 @@ def helper(inImage, c=0.3, outImage=None, show=False):
 		cv2.imwrite(outImage, lowpoly_image)
 
 	return lowpoly_image
-
-
-def main(args):
-	'''Main function'''
-	# No input image
-	if len(args) < 1:
-		print('Invalid')
-	# Input image specified
-	else:
-		input_image = args[0]
-		output_image = None
-		fraction = 0.15
-		# Output destination specified
-		if len(args) == 2:
-			output_image = args[1]
-		if len(args) == 3:
-			output_image = args[1]
-			fraction = float(args[2])
-		print("Processing started")
-		# Call helper function
-		helper(inImage=input_image, c=fraction,
-			   outImage=output_image, show=False)
-
-
-if __name__ == '__main__':
-	#warnings.filterwarnings("ignore")
-	main(sys.argv[1:])
