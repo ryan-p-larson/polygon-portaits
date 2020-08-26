@@ -4,7 +4,7 @@ Lowpolify any image using Delaunay triangulation
 
 Author: Ryan Larson, originally from @ghostwriternr: https://github.com/ghostwriternr/lowpolify
 """
-from os.path import abspath, dirname, join
+from os.path import abspath, dirname, join, exists
 from collections import defaultdict
 from typing import Tuple, List
 import cv2, dlib, numpy as np
@@ -23,32 +23,14 @@ DEFAULT_BG_BGR = [255, 255, 255]
 DEFAULT_BG_PAD = 100
 
 
-def pre_process(original_image, resize=None) -> Tuple[np.ndarray, np.ndarray]:
-	'''Preprocessing helper'''
-	height, width, channels = original_image.shape
-
-	# Handle grayscale images
-	if (channels == 1):
-		original_image = original_image.dstack([original_image, original_image, original_image])
-
-	# Resize image. Easier to process.
-	if ((resize is not None) and (resize < np.max(original_image.shape[:2]))):
-		scale          = resize / float(max(height, width))
-		original_image = cv2.resize(original_image, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-
-	# Reduce noise in image using cv::cuda::fastNlMeansDenoisingColored. Via: http://www.ipol.im/pub/art/2011/bcm_nlm/
-	noiseless_highpoly_image = cv2.fastNlMeansDenoisingColored(original_image, None, 10, 10, 7, 21)
-
-	return original_image, noiseless_highpoly_image
-
 def create_triangles(
 	image: np.ndarray,
 	gray_image: np.ndarray,
 	mask: np.ndarray,
-	a: int = DEFAULT_CANNY_A,
-	b: int = DEFAULT_CANNY_B,
-	c: float = DEFAULT_FRACTION_PERCENT,
-	show: bool = False) -> np.ndarray:
+	a: int = 50,
+	b: int = 55,
+	c: float = 0.1,
+	show: bool = False):
 	""" Returns triangulations
 		Given a raw portrait image, and its computed BW & Masked versions,
 		1. Search for faces, add landmarks
@@ -60,55 +42,60 @@ def create_triangles(
 	height_image, width_image = image.shape[:2]
 	points: np.ndarray
 
+	gray_gpu = cv2.cuda_GpuMat()
+	gray_gpu.upload(gray_image)
+
 	# Using canny edge detection. Reference: http://docs.opencv.org/3.1.0/da/d22/tutorial_py_canny.html
 	# First argument : Input image
 	# Second argument: minVal (argument 'a')
 	# Third argument : maxVal (argument 'b')
-	edges        		= cv2.Canny(gray_image, a, b)
-	num_points   		= int(np.where(edges)[0].size * c)
-	r, c         		= np.nonzero(edges)
-	rnd          		= np.zeros(r.shape) == 1
+	canny = cv2.cuda.createCannyEdgeDetector(a, b)
+	edges = canny.detect(gray_gpu)
+	edges = edges.download()
+
+	## CUDA
+	# num_points = int(cv2.cuda.countNonZero(edges) * c)
+	num_points = int(np.where(edges)[0].size * c)
+	r, c = np.nonzero(edges)
+	rnd  = np.zeros(r.shape) == 1
 	rnd[:num_points]	= True
 	np.random.shuffle(rnd)
 	points 				= np.vstack([r[rnd], c[rnd]]).T
+	# print(f"# canny_pts{num_points}")
 
-	# Using DLib to find facial landmarks
+	# # Using DLib to find facial landmarks
 	detector  = dlib.get_frontal_face_detector()
-	predictor = dlib.shape_predictor(DEFAULT_LANDMARKS_PATH)
+	predictor = dlib.shape_predictor('/content/drive/My Drive/tmp/shape_predictor_68_face_landmarks.dat')
 	dets 	  	= detector(image, 1)
-	shape 		= predictor(image, dets[0])
-	points 		= np.vstack([points,
-			[[shape.part(i).y, shape.part(i).x] for i in range(shape.num_parts)]])
 
-	# Filter to return only the points that fall within mask
-	filter_points = np.array([pt for pt in points
-			if (mask[tuple(pt)] == 255 if ((pt[1] < mask.shape[1]))  else False)])
+	if (len(dets) > 0):
+		shape 		= predictor(image, dets[0])
+		points 		= np.vstack([points, [[shape.part(i).y, shape.part(i).x]
+		                               for i in range(shape.num_parts)]])
 
-	# Add bottom left/right to make the shoulders look better
-	filter_points = np.vstack([
-		filter_points, [height_image, 0], [height_image, width_image - 100]])
+	# # Filter to return only the points that fall within mask
+	# # if (mask[tuple(pt)] > 0 if ((pt[1] < mask.shape[1]))  else False)])
+	filter_points = np.array([pt for pt in points if (mask[tuple(pt)] > 0)])
 
-	# Create Delauney triangles
-	delaunay         = Delaunay(filter_points, incremental=False)
+	# # Create Delauney triangles
+	delaunay         = Delaunay(filter_points, incremental=True)
+	delaunay.close()
 	triangles        = delaunay.points[delaunay.simplices]
 	filter_triangles = np.array([tri for tri in triangles
-			if (mask[int(Polygon(tri).centroid.x), int(Polygon(tri).centroid.y)] == 255)])
+			if (mask[int(Polygon(tri).centroid.x), int(Polygon(tri).centroid.y)] > 0)])
 
 	return filter_triangles
 
-def render_triangles(
-	triangles: np.ndarray,
-	image: np.ndarray,
-	bg: np.ndarray = DEFAULT_BG_BGR) -> np.ndarray:
-	image_dim = image.shape
-	low_poly  = np.full(image_dim, fill_value=bg, dtype=image.dtype)
+def render_triangles(triangles: np.ndarray, image: np.ndarray, fill=[255, 255, 255]):
+  height, width, channels = image.shape
+  output = np.full((height, width, channels), fill_value=fill, dtype=image.dtype)
 
-	for tri in triangles:
-		rr, cc     			 = draw_polygon(tri[:, 0], tri[:, 1], low_poly.shape)
-		color   				 = np.mean(image[draw_polygon(tri[:, 0], tri[:, 1], image_dim)], axis=0)
-		low_poly[rr, cc] = color
-
-	return low_poly
+  for tri in triangles:
+    rr, cc = draw_polygon(tri[:, 0], tri[:, 1], (height, width))
+    color  = np.mean(image[rr, cc], axis=0)
+    cv2.fillConvexPoly(output, tri[:, ::-1].astype('int32'), color)
+    # output[rr, cc] = color
+  return output
 
 def add_border(
 	image: np.ndarray,
@@ -200,3 +187,25 @@ def helper(inImage, c=0.3, outImage=None, show=False):
 		cv2.imwrite(outImage, lowpoly_image)
 
 	return lowpoly_image
+
+
+
+class Polygonz:
+	def __init__(self, landmark_path: str = DEFAULT_LANDMARKS_PATH):
+		# if not (exists(landmark_path)):
+		self.detector = dlib.get_frontal_face_detector()
+		self.landmark = dlib.shape_predictor(landmark_path)
+
+	def canny_edge_points(self,
+		gray: np.ndarray,
+		a: int = DEFAULT_CANNY_A,
+		b: int = DEFAULT_CANNY_B,
+		c: float = 0.1) -> np.ndarray:
+		edges 		       = cv2.Canny(gray, a, b)
+		r, c             = np.nonzero(edges)
+		num_points       = int(np.where(edges)[0].size * c)
+		rnd 						 = np.zeros(r.shape) == 1
+		rnd[:num_points] = True
+		np.random.shuffle(rnd)
+		points = np.vstack([r[rnd], c[rnd]]).T
+		return points
