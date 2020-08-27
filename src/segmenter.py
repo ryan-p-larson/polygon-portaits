@@ -21,7 +21,7 @@ class Segmenter(object):
 
     for row in range(image.shape[0]):
       for col in range(image.shape[1]):
-        cls            = segmented[row][col][0]
+        cls            = segmented[row][col]
         included       = (cls in include) if (len(include) > 0) else True
         excluded       = cls in exclude
         mask[row][col] = 1 if (included and not excluded) else 0
@@ -29,7 +29,7 @@ class Segmenter(object):
     # apply the mask to the image
     masked_image = cv2.bitwise_and(image, image, mask=cv2.UMat(mask))
 
-    return masked_image, mask
+    return cv2.UMat.get(masked_image), mask
 
   def segment(self, image: np.ndarray) -> (np.ndarray, np.ndarray):
     # First, resize the image if it's too small
