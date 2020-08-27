@@ -1,9 +1,35 @@
+from typing import List, Optional
 import numpy as np
-from .preprocessor import PreProcessor
+import cv2
+from preprocessor import PreProcessor
 
 class Segmenter(object):
-  def __init__(self, model=face_parser.FaceParser):
+  def __init__(self, model=None):
     self.model = model
+
+  @classmethod
+  def mask(cls,
+    image: np.ndarray,
+    segmented: np.ndarray,
+    include: Optional[List[int]] = [],
+    exclude: Optional[List[int]] = [0]) -> (np.ndarray, np.ndarray):
+
+    # first create mask from segments matching our criteria
+    include, exclude = set(include), set(exclude)
+    mask             = np.zeros(image.shape[:2], dtype=np.uint8)
+    print(f"include={include},\texclude={exclude}")
+
+    for row in range(image.shape[0]):
+      for col in range(image.shape[1]):
+        cls            = segmented[row][col][0]
+        included       = (cls in include) if (len(include) > 0) else True
+        excluded       = cls in exclude
+        mask[row][col] = 1 if (included and not excluded) else 0
+
+    # apply the mask to the image
+    masked_image = cv2.bitwise_and(image, image, mask=cv2.UMat(mask))
+
+    return masked_image, mask
 
   def segment(self, image: np.ndarray) -> (np.ndarray, np.ndarray):
     # First, resize the image if it's too small
@@ -15,12 +41,7 @@ class Segmenter(object):
     segs  = faces[0]
 
     # Construct mask by filtering/normalizing classes
-    mask  = np.zeros(resized_image.shape[:2], dtype=np.uint8)
-
-    for row in range(mask.shape[0]):
-      for col in range(mask.shape[1]):
-        cls = segs[row][col]
-        mask[row][col] = 255 if ((cls > 0) and (cls != 16)) else 0
+    masked, mask = self.mask(resized_image, segs, exclude=[0, 16])
 
     # Finally, resize the image to the original image passed in
     resized_mask = PreProcessor.scale_up(mask, max(height_og, width_og))
