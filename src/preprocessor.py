@@ -23,14 +23,14 @@ class PreProcessor:
     return image
 
   @classmethod
-  def colorize(cls, image: np.ndarray, code):
+  def colorize(cls, image: np.ndarray, code) -> np.ndarray:
     gpu_mat = cv2.cuda_GpuMat()
     gpu_mat.upload(image)
     gpu_out = cv2.cuda.cvtColor(gpu_mat, code)
     return gpu_out.download()
 
   @classmethod
-  def image_colors(cls, image: np.ndarray):
+  def image_colors(cls, image: np.ndarray) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
     height, width, channels = image.shape
     if (channels == 1):
       image   = cls.colorize(image, cv2.COLOR_GRAY2BGR)
@@ -40,7 +40,7 @@ class PreProcessor:
     return (image, noiseless, gray, ycrcb)
 
   @classmethod
-  def image_threshold(cls, gray: np.ndarray, ycrcb: np.ndarray):
+  def image_threshold(cls, gray: np.ndarray, ycrcb: np.ndarray) -> (np.ndarray, float, float):
     gray_gpu = cv2.cuda_GpuMat()
     ycrcb_gpu = cv2.cuda_GpuMat()
 
