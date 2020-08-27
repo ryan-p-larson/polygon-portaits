@@ -1,7 +1,6 @@
 *.pyc
 **/__pycache__
 *.cpp
-.vscode/
 
 # Photos
 *.png
@@ -9,3 +8,8 @@
 *.jpeg
 *.tif
 *.gif
+
+.vscode/
+*.css
+*.cvlab
+*.bz2
