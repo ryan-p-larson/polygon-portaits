@@ -3,6 +3,28 @@ import numpy as np
 import cv2
 from preprocessor import PreProcessor
 
+SEGMENT_MAP = {
+	0:  { 'c': 0.0, 'name': 'background' },
+	1:  { 'c': 0.0, 'name': 'skin' },
+	2:  { 'c': 0.0, 'name': 'left eyebrow' },
+	3:  { 'c': 0.0, 'name': 'right eyebrow' },
+	4:  { 'c': 0.0, 'name': 'left eye' },
+	5:  { 'c': 0.0, 'name': 'right eye' },
+	6:  { 'c': 0.0, 'name': 'glasses' },
+	7:  { 'c': 0.0, 'name': 'left ear' },
+	8:  { 'c': 0.0, 'name': 'right ear' },
+	9:  { 'c': 0.0, 'name': 'earings' },
+	10:  { 'c': 0.0, 'name': 'nose' },
+	11:  { 'c': 0.0, 'name': 'mouth' },
+	12:  { 'c': 0.0, 'name': 'upper lip' },
+	13:  { 'c': 0.0, 'name': 'lower lip' },
+	14:  { 'c': 0.0, 'name': 'neck' },
+	15:  { 'c': 0.0, 'name': 'neck_l' },
+	16:  { 'c': 0.0, 'name': 'cloth' },
+	17:  { 'c': 0.0, 'name': 'hair' },
+	18:  { 'c': 0.0, 'name': 'hat' }
+}
+
 class Segmenter(object):
   def __init__(self, model=None):
     self.model = model
@@ -17,7 +39,6 @@ class Segmenter(object):
     # first create mask from segments matching our criteria
     include, exclude = set(include), set(exclude)
     mask             = np.zeros(image.shape[:2], dtype=np.uint8)
-    print(f"include={include},\texclude={exclude}")
 
     for row in range(image.shape[0]):
       for col in range(image.shape[1]):

@@ -7,13 +7,6 @@ from imutils.face_utils import FACIAL_LANDMARKS_IDXS, shape_to_np
 
 DEFAULT_LANDMARKS_PATH = join(abspath(dirname(__file__)), "imgs", "shape_predictor_68_face_landmarks.dat")
 
-predictor = dlib.shape_predictor(DEFAULT_LANDMARKS_PATH)
-one_path  = join(abspath(dirname(__file__)), "imgs", "before_align.jpg")
-two_path  = join(abspath(dirname(__file__)), "imgs", "after_align.jpg")
-one       = cv2.imread(one_path)
-two = cv2.imread(two_path)
-
-
 class Alignment:
   def __init__(self,
     landmarks_path: str = DEFAULT_LANDMARKS_PATH):
@@ -105,6 +98,11 @@ class Alignment:
 
 
 
+predictor = dlib.shape_predictor(DEFAULT_LANDMARKS_PATH)
+one_path  = join(abspath(dirname(__file__)), "imgs", "before_align.jpg")
+two_path  = join(abspath(dirname(__file__)), "imgs", "after_align.jpg")
+one       = cv2.imread(one_path)
+two = cv2.imread(two_path)
 
 alignment = Alignment(DEFAULT_LANDMARKS_PATH)
 # test_one, test_delta = alignment.align_face(one)

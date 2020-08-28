@@ -6,7 +6,7 @@ Author: Ryan Larson, originally from @ghostwriternr: https://github.com/ghostwri
 """
 from os.path import abspath, dirname, join, exists
 from collections import defaultdict
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 import cv2, dlib, numpy as np
 from scipy.spatial import Delaunay
 from skimage.draw import polygon as draw_polygon
@@ -23,79 +23,6 @@ DEFAULT_BG_BGR = [255, 255, 255]
 DEFAULT_BG_PAD = 100
 
 
-def create_triangles(
-	image: np.ndarray,
-	gray_image: np.ndarray,
-	mask: np.ndarray,
-	a: int = 50,
-	b: int = 55,
-	c: float = 0.1,
-	show: bool = False):
-	""" Returns triangulations
-		Given a raw portrait image, and its computed BW & Masked versions,
-		1. Search for faces, add landmarks
-		2. Add bottom left/right points for shoulders
-		3. Add points falling within mask
-		4. Create Delauney Triangles
-		5. Filter triangles whose centroid does not intersect mask
-	"""
-	height_image, width_image = image.shape[:2]
-	points: np.ndarray
-
-	gray_gpu = cv2.cuda_GpuMat()
-	gray_gpu.upload(gray_image)
-
-	# Using canny edge detection. Reference: http://docs.opencv.org/3.1.0/da/d22/tutorial_py_canny.html
-	# First argument : Input image
-	# Second argument: minVal (argument 'a')
-	# Third argument : maxVal (argument 'b')
-	canny = cv2.cuda.createCannyEdgeDetector(a, b)
-	edges = canny.detect(gray_gpu)
-	edges = edges.download()
-
-	## CUDA
-	# num_points = int(cv2.cuda.countNonZero(edges) * c)
-	num_points = int(np.where(edges)[0].size * c)
-	r, c = np.nonzero(edges)
-	rnd  = np.zeros(r.shape) == 1
-	rnd[:num_points]	= True
-	np.random.shuffle(rnd)
-	points 				= np.vstack([r[rnd], c[rnd]]).T
-	# print(f"# canny_pts{num_points}")
-
-	# # Using DLib to find facial landmarks
-	detector  = dlib.get_frontal_face_detector()
-	predictor = dlib.shape_predictor('/content/drive/My Drive/tmp/shape_predictor_68_face_landmarks.dat')
-	dets 	  	= detector(image, 1)
-
-	if (len(dets) > 0):
-		shape 		= predictor(image, dets[0])
-		points 		= np.vstack([points, [[shape.part(i).y, shape.part(i).x]
-		                               for i in range(shape.num_parts)]])
-
-	# # Filter to return only the points that fall within mask
-	# # if (mask[tuple(pt)] > 0 if ((pt[1] < mask.shape[1]))  else False)])
-	filter_points = np.array([pt for pt in points if (mask[tuple(pt)] > 0)])
-
-	# # Create Delauney triangles
-	delaunay         = Delaunay(filter_points, incremental=True)
-	delaunay.close()
-	triangles        = delaunay.points[delaunay.simplices]
-	filter_triangles = np.array([tri for tri in triangles
-			if (mask[int(Polygon(tri).centroid.x), int(Polygon(tri).centroid.y)] > 0)])
-
-	return filter_triangles
-
-def render_triangles(triangles: np.ndarray, image: np.ndarray, fill=[255, 255, 255]):
-  height, width, channels = image.shape
-  output = np.full((height, width, channels), fill_value=fill, dtype=image.dtype)
-
-  for tri in triangles:
-    rr, cc = draw_polygon(tri[:, 0], tri[:, 1], (height, width))
-    color  = np.mean(image[rr, cc], axis=0)
-    cv2.fillConvexPoly(output, tri[:, ::-1].astype('int32'), color)
-    # output[rr, cc] = color
-  return output
 
 def add_border(
 	image: np.ndarray,
@@ -189,23 +116,194 @@ def helper(inImage, c=0.3, outImage=None, show=False):
 	return lowpoly_image
 
 
+def create_triangles(
+	image: np.ndarray,
+	gray_image: np.ndarray,
+	mask: np.ndarray,
+	a: int = 50,
+	b: int = 55,
+	c: float = 0.1,
+	show: bool = False):
+	""" Returns triangulations
+		Given a raw portrait image, and its computed BW & Masked versions,
+		1. Search for faces, add landmarks
+		2. Add bottom left/right points for shoulders
+		3. Add points falling within mask
+		4. Create Delauney Triangles
+		5. Filter triangles whose centroid does not intersect mask
+	"""
+	height_image, width_image = image.shape[:2]
+	points: np.ndarray
+
+	gray_gpu = cv2.cuda_GpuMat()
+	gray_gpu.upload(gray_image)
+
+	# Using canny edge detection. Reference: http://docs.opencv.org/3.1.0/da/d22/tutorial_py_canny.html
+	# First argument : Input image
+	# Second argument: minVal (argument 'a')
+	# Third argument : maxVal (argument 'b')
+	canny = cv2.cuda.createCannyEdgeDetector(a, b)
+	edges = canny.detect(gray_gpu)
+	edges = edges.download()
+
+	## CUDA
+	num_points = int(np.where(edges)[0].size * c)
+	r, c = np.nonzero(edges)
+	rnd  = np.zeros(r.shape) == 1
+	rnd[:num_points]	= True
+	np.random.shuffle(rnd)
+	points 				= np.vstack([r[rnd], c[rnd]]).T
+
+	# # Using DLib to find facial landmarks
+	detector  = dlib.get_frontal_face_detector()
+	predictor = dlib.shape_predictor('/content/drive/My Drive/tmp/shape_predictor_68_face_landmarks.dat')
+	dets 	  	= detector(image, 1)
+
+	# print(f"# face_detections={len(dets)}")
+	if (len(dets) > 0):
+		shape 		= predictor(image, dets[0])
+		points 		= np.vstack([points, [[shape.part(i).y, shape.part(i).x]
+		                               for i in range(shape.num_parts)]])
+
+	# # Filter to return only the points that fall within mask
+	# # if (mask[tuple(pt)] > 0 if ((pt[1] < mask.shape[1]))  else False)])
+	filter_points = np.array([pt for pt in points if (mask[tuple(pt)] > 0)])
+
+	# # Create Delauney triangles
+	# print(f"# filter_pts={len(filter_points)}")
+	delaunay         = Delaunay(filter_points, incremental=True)
+	delaunay.close()
+	# delaunay         = Delaunay(filter_points)
+	triangles        = delaunay.points[delaunay.simplices]
+	filter_triangles = np.array([tri for tri in triangles
+			if (mask[int(Polygon(tri).centroid.x), int(Polygon(tri).centroid.y)] > 0)])
+
+	return filter_triangles
+
+def render_triangles(triangles: np.ndarray, image: np.ndarray, fill=[255, 255, 255]):
+  height, width, channels = image.shape
+  output = np.full((height, width, channels), fill_value=fill, dtype=image.dtype)
+
+  for tri in triangles:
+    rr, cc = draw_polygon(tri[:, 0], tri[:, 1], (height, width))
+    color  = np.mean(image[rr, cc], axis=0)
+    cv2.fillConvexPoly(output, tri[:, ::-1].astype('int32'), color)
+
+  return output
+
+
+SEGMENT_MAP = {
+	0:  { 'c': 0.0, 'name': 'background' },
+	1:  { 'c': 0.0, 'name': 'skin' },
+	2:  { 'c': 0.0, 'name': 'left eyebrow' },
+	3:  { 'c': 0.0, 'name': 'right eyebrow' },
+	4:  { 'c': 0.0, 'name': 'left eye' },
+	5:  { 'c': 0.0, 'name': 'right eye' },
+	6:  { 'c': 0.0, 'name': 'glasses' },
+	7:  { 'c': 0.0, 'name': 'left ear' },
+	8:  { 'c': 0.0, 'name': 'right ear' },
+	9:  { 'c': 0.0, 'name': 'earings' },
+	10:  { 'c': 0.0, 'name': 'nose' },
+	11:  { 'c': 0.0, 'name': 'mouth' },
+	12:  { 'c': 0.0, 'name': 'upper lip' },
+	13:  { 'c': 0.0, 'name': 'lower lip' },
+	14:  { 'c': 0.0, 'name': 'neck' },
+	15:  { 'c': 0.0, 'name': 'neck_l' },
+	16:  { 'c': 0.0, 'name': 'cloth' },
+	17:  { 'c': 0.0, 'name': 'hair' },
+	18:  { 'c': 0.0, 'name': 'hat' }
+}
+
+
+from segmenter import Segmenter
 
 class Polygonz:
-	def __init__(self, landmark_path: str = DEFAULT_LANDMARKS_PATH):
-		# if not (exists(landmark_path)):
-		self.detector = dlib.get_frontal_face_detector()
-		self.landmark = dlib.shape_predictor(landmark_path)
+	def __init__(self, landmarks_path: str):
+		# self.mat       = cv2.cuda_GpuMat()
+		# self.stream    = cv2.cuda_Stream()
+		self.detector  = dlib.get_frontal_face_detector()
+		self.predictor = dlib.shape_predictor(landmarks_path)
 
-	def canny_edge_points(self,
-		gray: np.ndarray,
-		a: int = DEFAULT_CANNY_A,
-		b: int = DEFAULT_CANNY_B,
-		c: float = 0.1) -> np.ndarray:
-		edges 		       = cv2.Canny(gray, a, b)
-		r, c             = np.nonzero(edges)
-		num_points       = int(np.where(edges)[0].size * c)
-		rnd 						 = np.zeros(r.shape) == 1
-		rnd[:num_points] = True
+	def create_points(self, gray: np.ndarray, a: int, b: int, c: int) -> np.ndarray:
+		# self.mat.upload(gray)
+		# canny = cv2.cuda.createCannyEdgeDetector(a, b)
+		# edges = canny.detect(gray_gpu)
+		# edges = edges.download()
+		edges = cv2.Canny(gray, a, b)
+
+		num_points = int(np.where(edges)[0].size * c)
+		r, c = np.nonzero(edges)
+		rnd  = np.zeros(r.shape) == 1
+		rnd[:num_points]	= True
 		np.random.shuffle(rnd)
 		points = np.vstack([r[rnd], c[rnd]]).T
+
 		return points
+
+	def create_triangles(self, mask: np.ndarray, gray: np.ndarray, a: int, b: int, c_map: Dict[int, float]):
+		detections = self.detector(gray, 1)
+		shape      = self.predictor(gray, detections[0])
+		points 		 = np.array([[shape.part(i).y, shape.part(i).x] for i in range(shape.num_parts)], dtype=np.uint8)
+
+		for (seg_idx, seg_coeff) in c_map.items():
+			gray_segment, segment_mask = Segmenter.mask(gray, mask, include=[seg_idx])
+			canny_points = self.create_points(gray_segment, a, b, seg_coeff)
+			points = np.vstack([points, canny_points])
+
+		delaunay = Delaunay(filter_points, incremental=True)
+		delaunay.close()
+		triangles = delaunay.points[delaunay.simplices]
+
+		return triangles
+
+	def render_triangles(self, image: np.ndarray, triangles: np.ndarray, output=None):
+		height, width, channels = image.shape
+		if (output == None):
+			output = np.zeros((height, width, 3), np.uint8)
+		for tri in triangles:
+			rr, cc = draw_polygon(tri[:, 0], tri[:, 1], (height, width))
+			color  = np.mean(image[rr, cc], axis=0)
+			cv2.fillConvexPoly(output, tri[:, ::-1].astype('uint8'), color)
+		return output
+
+	def polygonize(self, image: np.ndarray, gray: np.ndarray, segments: np.ndarray, a: int, b: int, c_map: Dict[int, float]):
+		triangles = self.create_triangles(segments, gray, a, b, c_map)
+		polygons  = self.render_triangles(image, triangles)
+		return polygons
+
+
+poly = Polygonz(DEFAULT_LANDMARKS_PATH)
+one_path  = join(abspath(dirname(__file__)), "imgs", "before_align.jpg")
+two_path  = join(abspath(dirname(__file__)), "imgs", "after_align.jpg")
+one       = cv2.imread(one_path)
+two       = cv2.imread(two_path)
+
+gray = cv2.cvtColor(one, cv2.COLOR_BGR2GRAY)
+test_segs = {
+	1:  0.05,
+	2:  0.05,
+	3:  0.05,
+	4:  0.05,
+	5:  0.05,
+	6:  0.05,
+	7:  0.05,
+	8:  0.05,
+	9:  0.05,
+	10: 0.1,
+	11: 0.05,
+	12: 0.05,
+	13: 0.05,
+	14: 0.05,
+	15: 0.05,
+	16: 0.05,
+	17: 0.001,
+	18: 0.05
+}
+poly.create_triangles(gray, 50, 85, {0: 15.0})
+
+# cv2.imshow('Test alignmnet', test_one)
+# while True:
+#   ch = cv2.waitKey(1)
+#   if ch == 27 or ch == ord('q') or ch == ord('Q'):
+#     break
+# cv2.destroyAllWindows()
